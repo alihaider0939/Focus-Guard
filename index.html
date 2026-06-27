@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Phone-in-Hand Alarm Monitor</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    max-width: 480px;
+    margin: 40px auto;
+    padding: 0 20px;
+    color: #1a1a1a;
+    background: #f7f7f5;
+  }
+  h1 { font-size: 20px; font-weight: 600; margin-bottom: 4px; }
+  p.subtitle { color: #666; font-size: 14px; margin-top: 0; margin-bottom: 24px; }
+
+  .row { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }
+  .row label { font-size: 14px; color: #555; min-width: 120px; }
+  input[type=range] { flex: 1; }
+  .row span { font-size: 14px; font-weight: 600; min-width: 48px; text-align: right; }
+
+  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 20px; }
+  .stat-card { background: #fff; border: 1px solid #e3e3e0; border-radius: 10px; padding: 14px; }
+  .stat-card p.label { font-size: 12px; color: #777; margin: 0 0 4px; }
+  .stat-card p.value { font-size: 17px; font-weight: 600; margin: 0; }
+
+  .cam-wrap {
+    position: relative;
+    background: #eceae5;
+    border-radius: 14px;
+    padding: 12px;
+    display: flex;
+    justify-content: center;
+    margin-bottom: 20px;
+  }
+  video, canvas { width: 100%; max-width: 360px; border-radius: 10px; background: #000; }
+  canvas { position: absolute; top: 12px; left: 50%; transform: translateX(-50%); pointer-events: none; }
+
+  #alarm-overlay {
+    display: none;
+    position: absolute;
+    inset: 12px;
+    border-radius: 10px;
+    align-items: center;
+    justify-content: center;
+    background: rgba(226, 75, 74, 0.88);
+    animation: flash 0.6s infinite alternate;
+  }
+  @keyframes flash {
+    from { background: rgba(226, 75, 74, 0.88); }
+    to   { background: rgba(180, 30, 30, 0.95); }
+  }
+  #alarm-overlay .msg { text-align: center; color: #fff; }
+  #alarm-overlay .msg p { font-size: 18px; font-weight: 600; margin: 8px 0 0; }
+
+  .buttons { display: flex; gap: 12px; margin-bottom: 12px; }
+  button {
+    flex: 1;
+    padding: 10px 14px;
+    border-radius: 8px;
+    border: 1px solid #d8d8d4;
+    background: #fff;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:hover:not(:disabled) { background: #f0f0ee; }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+  p.note { font-size: 12px; color: #999; line-height: 1.5; }
+</style>
+</head>
+<body>
+
+  <h1>Phone-in-hand alarm monitor</h1>
+  <p class="subtitle">Uses your webcam and an in-browser object detection model to spot a phone in frame. If it stays detected continuously past your threshold, you get a flashing red alarm and a sound. Everything runs locally in your browser — no video is recorded or uploaded.</p>
+
+  <div class="row">
+    <label for="threshold">Alarm threshold</label>
+    <input type="range" id="threshold" min="3" max="60" step="1" value="10">
+    <span id="threshold-out">10s</span>
+  </div>
+
+  <div class="stats">
+    <div class="stat-card">
+      <p class="label">Status</p>
+      <p class="value" id="cam-status">Not started</p>
+    </div>
+    <div class="stat-card">
+      <p class="label">Phone in view for</p>
+      <p class="value" id="phone-time">0.0s</p>
+    </div>
+  </div>
+
+  <div class="cam-wrap">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="overlay-canvas"></canvas>
+    <div id="alarm-overlay">
+      <div class="msg">
+        <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
+          <line x1="12" y1="9" x2="12" y2="13"></line>
+          <line x1="12" y1="17" x2="12.01" y2="17"></line>
+        </svg>
+        <p>Phone alarm</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="buttons">
+    <button id="start-btn">Start monitoring</button>
+    <button id="stop-btn" disabled>Stop</button>
+  </div>
+
+  <p class="note">First start may take a few seconds while the detection model loads (a few MB, downloaded from a CDN — needs internet the first time, then it's cached by your browser). Detection uses the standard COCO-SSD model's "cell phone" class, checked roughly 3 times per second. Works best in decent lighting with the phone clearly visible to the camera.</p>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<script>
+(function () {
+  const thresholdSlider = document.getElementById('threshold');
+  const thresholdOut = document.getElementById('threshold-out');
+  const camStatus = document.getElementById('cam-status');
+  const phoneTimeEl = document.getElementById('phone-time');
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('overlay-canvas');
+  const ctx = canvas.getContext('2d');
+  const overlay = document.getElementById('alarm-overlay');
+  const startBtn = document.getElementById('start-btn');
+  const stopBtn = document.getElementById('stop-btn');
+
+  let threshold = 10;
+  let stream = null;
+  let model = null;
+  let detectLoop = null;
+  let phoneStartTime = null;
+  let lastSeenTime = null;
+  let audioCtx = null;
+  let alarmOn = false;
+  let alarmOsc = null;
+  let running = false;
+
+  thresholdSlider.addEventListener('input', () => {
+    threshold = parseInt(thresholdSlider.value, 10);
+    thresholdOut.textContent = threshold + 's';
+  });
+
+  function ensureAudio() {
+    if (!audioCtx) {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+  }
+
+  function startAlarmSound() {
+    if (alarmOn) return;
+    ensureAudio();
+    alarmOn = true;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = 'square';
+    osc.frequency.value = 880;
+    gain.gain.value = 0.0001;
+    osc.connect(gain).connect(audioCtx.destination);
+    osc.start();
+    let high = true;
+    const sweep = setInterval(() => {
+      if (!alarmOn) { clearInterval(sweep); return; }
+      osc.frequency.setTargetAtTime(high ? 880 : 660, audioCtx.currentTime, 0.05);
+      high = !high;
+    }, 350);
+    gain.gain.setTargetAtTime(0.08, audioCtx.currentTime, 0.05);
+    alarmOsc = { osc, gain, sweep };
+  }
+
+  function stopAlarmSound() {
+    if (!alarmOn || !alarmOsc) { alarmOn = false; return; }
+    alarmOn = false;
+    const { osc, gain, sweep } = alarmOsc;
+    clearInterval(sweep);
+    gain.gain.setTargetAtTime(0.0001, audioCtx.currentTime, 0.05);
+    setTimeout(() => { try { osc.stop(); } catch (e) {} }, 300);
+    alarmOsc = null;
+  }
+
+  function setAlarm(on) {
+    overlay.style.display = on ? 'flex' : 'none';
+    if (on) startAlarmSound(); else stopAlarmSound();
+  }
+
+  function drawBoxes(predictions) {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    predictions.forEach(p => {
+      if (p.class !== 'cell phone') return;
+      const [x, y, w, h] = p.bbox;
+      ctx.strokeStyle = '#e24b4a';
+      ctx.lineWidth = 3;
+      ctx.strokeRect(x, y, w, h);
+      ctx.fillStyle = '#e24b4a';
+      ctx.font = '14px sans-serif';
+      ctx.fillText('phone ' + Math.round(p.score * 100) + '%', x, y > 16 ? y - 6 : y + 16);
+    });
+  }
+
+  async function detectFrame() {
+    if (!running || !model) return;
+    const predictions = await model.detect(video);
+    const phoneDetected = predictions.some(p => p.class === 'cell phone' && p.score > 0.5);
+
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    drawBoxes(predictions);
+
+    const now = performance.now();
+    if (phoneDetected) {
+      if (!phoneStartTime || (lastSeenTime && now - lastSeenTime > 1500)) {
+        phoneStartTime = now;
+      }
+      lastSeenTime = now;
+    }
+
+    let elapsed = 0;
+    if (phoneStartTime && lastSeenTime && now - lastSeenTime <= 1500) {
+      elapsed = (now - phoneStartTime) / 1000;
+    } else {
+      phoneStartTime = null;
+    }
+    phoneTimeEl.textContent = elapsed.toFixed(1) + 's';
+    setAlarm(elapsed >= threshold);
+
+    detectLoop = setTimeout(detectFrame, 300);
+  }
+
+  startBtn.addEventListener('click', async () => {
+    try {
+      startBtn.disabled = true;
+      camStatus.textContent = 'Loading model...';
+      camStatus.style.color = '#888';
+
+      stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      video.srcObject = stream;
+      await new Promise(resolve => { video.onloadedmetadata = resolve; });
+
+      if (!model) {
+        model = await cocoSsd.load();
+      }
+
+      camStatus.textContent = 'Watching';
+      camStatus.style.color = '#1d9e75';
+      stopBtn.disabled = false;
+      ensureAudio();
+      running = true;
+      detectFrame();
+    } catch (err) {
+      camStatus.textContent = 'Camera or model failed';
+      camStatus.style.color = '#e24b4a';
+      startBtn.disabled = false;
+      console.error(err);
+    }
+  });
+
+  stopBtn.addEventListener('click', () => {
+    running = false;
+    if (detectLoop) clearTimeout(detectLoop);
+    if (stream) {
+      stream.getTracks().forEach(t => t.stop());
+      stream = null;
+    }
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    setAlarm(false);
+    camStatus.textContent = 'Stopped';
+    camStatus.style.color = '#666';
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    phoneStartTime = null;
+    lastSeenTime = null;
+    phoneTimeEl.textContent = '0.0s';
+  });
+})();
+</script>
+</body>
+</html>
